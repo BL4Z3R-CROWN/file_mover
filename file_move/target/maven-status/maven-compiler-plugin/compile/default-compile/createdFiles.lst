@@ -1,0 +1,6 @@
+com\bluechip\move_files\FileMover\FileMover$1.class
+com\bluechip\move_files\model\GenericDBModel.class
+com\bluechip\move_files\Scheduler\MopUpScheduler.class
+com\bluechip\move_files\MoveFilesApplication.class
+com\bluechip\move_files\model\AppSettingsModel.class
+com\bluechip\move_files\FileMover\FileMover.class
