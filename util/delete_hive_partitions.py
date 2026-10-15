@@ -15,34 +15,44 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def get_matching_hive_partitions(spark, table_name, tbl_dt_values):
+def create_spark_session(table_name):
     """
-    Use SHOW PARTITIONS (a pure Hive Metastore metadata operation) instead of
-    SELECT COUNT(*), which triggers HadoopRDD.getInputFormat() and fails with
-    java.lang.InstantiationException if InputFormat is unset/abstract on any partition.
+    Create a SparkSession that supports BOTH native Hive tables and
+    Iceberg tables registered in the Hive Metastore.
     """
-    target_set = {str(dt) for dt in tbl_dt_values}
-    partitions_df = spark.sql(f"SHOW PARTITIONS {table_name}")
-    all_partitions = [row[0] for row in partitions_df.collect()]
+    spark = SparkSession \
+        .builder \
+        .appName(f"purge_partitions:{table_name}") \
+        .config("spark.driver.maxResultSize", "256g") \
+        .config("spark.sql.debug.maxToStringFields", 1000) \
+        .config("spark.sql.parquet.writeLegacyFormat", "false") \
+        .config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS") \
+        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+        .config("spark.sql.catalog.iceberg", "org.apache.iceberg.spark.SparkCatalog") \
+        .config("spark.sql.catalog.iceberg.type", "hive") \
+        .config("spark.sql.catalog.iceberg.warehouse", "hdfs://10.1.154.3:9000/warehouse/hive") \
+        .config("spark.hadoop.fs.defaultFS", "hdfs://10.1.154.3:9000") \
+        .config("hive.metastore.uris", "thrift://10.1.154.38:9083") \
+        .config("spark.sql.warehouse.dir", "hdfs://10.1.154.3:9000/warehouse/hive") \
+        .config("spark.sql.shuffle.partitions", 200) \
+        .config("spark.sql.adaptive.enabled", "true") \
+        .config("spark.sql.parquet.enableVectorizedWriter", "true") \
+        .enableHiveSupport() \
+        .getOrCreate()
 
-    matched_partitions = []
-    for part_spec in all_partitions:
-        # part_spec looks like "tbl_dt=20260629" (or "tbl_dt=20260629/...")
-        for token in part_spec.split("/"):
-            if token.startswith("tbl_dt="):
-                val = token.split("=", 1)[1].strip("'\"")
-                if val in target_set:
-                    matched_partitions.append(part_spec)
-                break
-
-    return sorted(matched_partitions)
+    spark.sparkContext.setLogLevel('OFF')
+    return spark
 
 
 def inspect_table_metadata(spark, table_name):
     """
-    Log key metadata from DESCRIBE FORMATTED so we can see Location, InputFormat,
-    Table Type, and whether the table is MANAGED, EXTERNAL, or ICEBERG.
+    Inspect DESCRIBE FORMATTED from the Hive Metastore and detect whether
+    the table is an Iceberg table (table_type=ICEBERG) or a standard Hive table.
     """
+    is_iceberg = False
+    location = None
+    meta_lines = []
+
     try:
         desc_rows = spark.sql(f"DESCRIBE FORMATTED {table_name}").collect()
         interesting_keys = {
@@ -54,12 +64,18 @@ def inspect_table_metadata(spark, table_name):
             "OutputFormat",
             "Table Properties",
         }
-        meta_lines = []
         for row in desc_rows:
             col_name = (row[0] or "").strip().rstrip(":")
             data_type = (row[1] or "").strip()
             if col_name in interesting_keys:
                 meta_lines.append(f"  {col_name}: {data_type}")
+            if col_name == "Location" and data_type:
+                location = data_type
+            if col_name == "Table Properties" and "table_type=ICEBERG" in data_type.upper():
+                is_iceberg = True
+            if col_name == "Provider" and data_type.lower() == "iceberg":
+                is_iceberg = True
+
         if meta_lines:
             logger.info(
                 "Table metadata for %s:\n%s",
@@ -67,47 +83,162 @@ def inspect_table_metadata(spark, table_name):
                 "\n".join(meta_lines)
             )
     except Exception as exc:
-        logger.warning(f"Could not inspect metadata for {table_name}: {exc}")
+        logger.warning(f"Could not inspect Hive metadata for {table_name}: {exc}")
+
+    return is_iceberg, location
 
 
-def delete_hive_tbl_dt_partitions(
+def get_matching_hive_partitions(spark, table_name, tbl_dt_values):
+    """
+    Use SHOW PARTITIONS for native Hive tables.
+    """
+    target_set = {str(dt) for dt in tbl_dt_values}
+    partitions_df = spark.sql(f"SHOW PARTITIONS {table_name}")
+    all_partitions = [row[0] for row in partitions_df.collect()]
+
+    matched_partitions = []
+    for part_spec in all_partitions:
+        for token in part_spec.split("/"):
+            if token.startswith("tbl_dt="):
+                val = token.split("=", 1)[1].strip("'\"")
+                if val in target_set:
+                    matched_partitions.append(part_spec)
+                break
+
+    return sorted(matched_partitions)
+
+
+def handle_iceberg_table(
+    spark,
+    table_name,
+    tbl_dt_values,
+    dry_run=False,
+    expire_snapshots=False,
+    remove_orphans=False
+):
+    iceberg_table_name = f"iceberg.{table_name}"
+    partition_filter = ", ".join(str(x) for x in tbl_dt_values)
+
+    logger.info(
+        "%sDetected table %s is an ICEBERG table in Hive Metastore (using %s)",
+        "[DRY RUN] " if dry_run else "",
+        table_name,
+        iceberg_table_name
+    )
+
+    delete_sql = f"""
+        DELETE FROM {iceberg_table_name}
+        WHERE tbl_dt IN ({partition_filter})
+    """
+
+    # Fast metadata check using Iceberg's .partitions metadata table
+    partitions_meta_sql = f"""
+        SELECT partition.tbl_dt AS tbl_dt, record_count, file_count
+        FROM {iceberg_table_name}.partitions
+        WHERE partition.tbl_dt IN ({partition_filter})
+        ORDER BY tbl_dt
+    """
+
+    if dry_run:
+        logger.info(f"[DRY RUN] Would execute Iceberg DELETE SQL:\n{delete_sql}")
+        logger.info(
+            "[DRY RUN] Querying Iceberg metadata table (%s.partitions) for existing partitions...",
+            iceberg_table_name
+        )
+        try:
+            existing_df = spark.sql(partitions_meta_sql)
+            rows = existing_df.collect()
+            logger.info(f"[DRY RUN] Matching partitions currently in Iceberg metadata: {len(rows)}")
+            if rows:
+                existing_df.show(len(rows), truncate=False)
+        except Exception as exc:
+            logger.warning(
+                f"Could not query {iceberg_table_name}.partitions metadata table ({exc}); "
+                "falling back to SELECT COUNT(*)"
+            )
+            fallback_sql = f"""
+                SELECT tbl_dt, COUNT(*) AS row_count
+                FROM {iceberg_table_name}
+                WHERE tbl_dt IN ({partition_filter})
+                GROUP BY tbl_dt
+                ORDER BY tbl_dt
+            """
+            existing_df = spark.sql(fallback_sql)
+            existing_count = existing_df.count()
+            logger.info(f"[DRY RUN] Matching partitions currently in Iceberg table: {existing_count}")
+            if existing_count > 0:
+                existing_df.show(existing_count, truncate=False)
+        return
+
+    # 1. Execute Iceberg DELETE
+    logger.info(f"Running Iceberg delete:\n{delete_sql}")
+    spark.sql(delete_sql)
+
+    # 2. Validate delete
+    check_sql = f"""
+        SELECT tbl_dt, COUNT(*) AS row_count
+        FROM {iceberg_table_name}
+        WHERE tbl_dt IN ({partition_filter})
+        GROUP BY tbl_dt
+    """
+    logger.info("Validating deleted partitions:\n%s", check_sql)
+    remaining_df = spark.sql(check_sql)
+    remaining_count = remaining_df.count()
+    logger.info(f"remaining_count after deletion: {remaining_count}")
+
+    if remaining_count > 0:
+        logger.error(
+            "Delete validation failed. Some tbl_dt values still exist in %s",
+            iceberg_table_name
+        )
+        remaining_df.show(truncate=False)
+        raise RuntimeError(
+            f"Delete validation failed for tbl_dt values: {tbl_dt_values}"
+        )
+
+    logger.info(
+        "Delete validation passed. tbl_dt partitions removed from current Iceberg snapshot: %s",
+        tbl_dt_values
+    )
+
+    # 3. Optional Iceberg snapshot expiration & orphan cleanup
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    if expire_snapshots:
+        expire_sql = f"""
+            CALL iceberg.system.expire_snapshots(
+                table => '{table_name}',
+                older_than => TIMESTAMP '{now}',
+                retain_last => 1,
+                stream_results => true
+            )
+        """
+        logger.info("Expiring Iceberg snapshots:\n%s", expire_sql)
+        spark.sql(expire_sql).show(truncate=False)
+
+    if remove_orphans:
+        remove_orphan_sql = f"""
+            CALL iceberg.system.remove_orphan_files(
+                table => '{table_name}',
+                dry_run => false
+            )
+        """
+        logger.info("Removing Iceberg orphan files:\n%s", remove_orphan_sql)
+        spark.sql(remove_orphan_sql).show(truncate=False)
+
+
+def handle_native_hive_table(
+    spark,
     table_name,
     tbl_dt_values,
     dry_run=False,
     batch_size=100
 ):
-    spark = SparkSession \
-        .builder \
-        .appName(f"drop_hive_partitions:{table_name}") \
-        .config("spark.driver.maxResultSize", "256g") \
-        .config("spark.sql.debug.maxToStringFields", 1000) \
-        .config("spark.sql.parquet.writeLegacyFormat", "false") \
-        .config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS") \
-        .config("spark.hadoop.fs.defaultFS", "hdfs://10.1.154.3:9000") \
-        .config("hive.metastore.uris", "thrift://10.1.154.38:9083") \
-        .config("spark.sql.warehouse.dir", "hdfs://10.1.154.3:9000/warehouse/hive") \
-        .config("spark.sql.shuffle.partitions", 200) \
-        .config("spark.sql.adaptive.enabled", "true") \
-        .config("spark.sql.parquet.enableVectorizedWriter", "true") \
-        .enableHiveSupport() \
-        .getOrCreate()
-
-    spark.sparkContext.setLogLevel('OFF')
-
-    if not tbl_dt_values:
-        raise ValueError("tbl_dt_values cannot be empty.")
-
     logger.info(
-        "%sPreparing to drop tbl_dt partitions %s from Hive table %s",
+        "%sDetected table %s is a NATIVE HIVE table.",
         "[DRY RUN] " if dry_run else "",
-        tbl_dt_values,
         table_name
     )
 
-    # Inspect table metadata (Location, InputFormat, Type, etc.)
-    inspect_table_metadata(spark, table_name)
-
-    # 1. Drop partitions from the Hive Metastore in batches (tbl_dt is INT).
     for i in range(0, len(tbl_dt_values), batch_size):
         batch = tbl_dt_values[i:i + batch_size]
         partition_specs = ",\n            ".join(
@@ -126,7 +257,6 @@ def delete_hive_tbl_dt_partitions(
             logger.info(f"Running Hive drop partitions:\n{drop_partition_sql}")
             spark.sql(drop_partition_sql)
 
-    # 2. Check / Validate partitions in Hive Metastore via SHOW PARTITIONS.
     if dry_run:
         logger.info("[DRY RUN] Checking existing partitions in Hive Metastore via SHOW PARTITIONS...")
         matched = get_matching_hive_partitions(spark, table_name, tbl_dt_values)
@@ -176,7 +306,6 @@ def generate_date_range(start_date, end_date):
 
 def run_command(cmd):
     try:
-        # Run the command and capture its output as text.
         output = subprocess.check_output(cmd, shell=True, text=True)
         return output
     except subprocess.CalledProcessError as e:
@@ -187,9 +316,9 @@ def run_command(cmd):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Drop tbl_dt partitions from a Hive table and clean up the "
-            "corresponding HDFS data files. start-date, end-date, and "
-            "table-name are all required."
+            "Delete tbl_dt partitions from a Hive or Iceberg table and clean up "
+            "the corresponding HDFS data files. Automatically detects whether "
+            "the table in the Hive Metastore is native Hive or Iceberg."
         )
     )
     parser.add_argument(
@@ -208,7 +337,7 @@ def parse_args():
         "--table-name",
         required=True,
         help=(
-            "Hive table to operate on, format database.table "
+            "Table to operate on, format database.table "
             "(e.g. customer_analytics.url_dm)."
         ),
     )
@@ -216,9 +345,19 @@ def parse_args():
         "--dry-run",
         action="store_true",
         help=(
-            "Preview the Hive SQL and HDFS delete commands and check existing "
+            "Preview the SQL and HDFS delete commands and check existing "
             "partitions without deleting any metadata or files."
         ),
+    )
+    parser.add_argument(
+        "--expire-snapshots",
+        action="store_true",
+        help="(Iceberg only) Run expire_snapshots procedure after deleting partitions.",
+    )
+    parser.add_argument(
+        "--remove-orphans",
+        action="store_true",
+        help="(Iceberg only) Run remove_orphan_files procedure after deleting partitions.",
     )
 
     args = parser.parse_args()
@@ -256,7 +395,6 @@ if __name__ == "__main__":
 
     database_name, _, bare_table_name = table_name.partition(".")
 
-    # Generate the date range from start_date to end_date
     tbl_dt_lst = generate_date_range(start_date, end_date)
 
     logger.info(
@@ -265,16 +403,35 @@ if __name__ == "__main__":
         tbl_dt_lst
     )
 
-    delete_hive_tbl_dt_partitions(
-        table_name=table_name,
-        tbl_dt_values=tbl_dt_lst,
-        dry_run=dry_run
-    )
+    spark = create_spark_session(table_name)
+    is_iceberg, table_location = inspect_table_metadata(spark, table_name)
 
-    hdfs_base_path = (
-        f"hdfs://ikudmadd18.mtn.com.ng:9000/warehouse/hive/"
-        f"{database_name}.db/{bare_table_name}/tbl_dt"
-    )
+    if is_iceberg:
+        handle_iceberg_table(
+            spark=spark,
+            table_name=table_name,
+            tbl_dt_values=tbl_dt_lst,
+            dry_run=dry_run,
+            expire_snapshots=args.expire_snapshots,
+            remove_orphans=args.remove_orphans,
+        )
+        # Iceberg tables store partition folders under /data/tbl_dt=<dt>
+        hdfs_base_path = (
+            f"hdfs://ikudmadd18.mtn.com.ng:9000/warehouse/hive/"
+            f"{database_name}.db/{bare_table_name}/data/tbl_dt"
+        )
+    else:
+        handle_native_hive_table(
+            spark=spark,
+            table_name=table_name,
+            tbl_dt_values=tbl_dt_lst,
+            dry_run=dry_run,
+        )
+        # Native Hive tables store partition folders directly under /tbl_dt=<dt>
+        hdfs_base_path = (
+            f"hdfs://ikudmadd18.mtn.com.ng:9000/warehouse/hive/"
+            f"{database_name}.db/{bare_table_name}/tbl_dt"
+        )
 
     delete_commands = [
         f"hdfs dfs -rm -r -f {hdfs_base_path}={tbl_dt}"
