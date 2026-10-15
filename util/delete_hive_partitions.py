@@ -1,4 +1,5 @@
 import argparse
+import calendar
 import concurrent.futures
 import logging
 import subprocess
@@ -297,9 +298,33 @@ def handle_native_hive_table(
     )
 
 
+def parse_yyyymmdd(date_int, label="date"):
+    date_str = str(date_int).strip()
+    year = int(date_str[0:4])
+    month = int(date_str[4:6])
+    day = int(date_str[6:8])
+
+    if not (1 <= month <= 12):
+        raise ValueError(f"Invalid month {month:02d} in {label}={date_str} (expected 01..12).")
+
+    max_day = calendar.monthrange(year, month)[1]
+    if day > max_day:
+        clamped_str = f"{year:04d}{month:02d}{max_day:02d}"
+        logger.warning(
+            "%s=%s has day %02d which is out of range for %04d-%02d (max %02d days); "
+            "automatically clamping to %s.",
+            label, date_str, day, year, month, max_day, clamped_str
+        )
+        day = max_day
+    elif day < 1:
+        raise ValueError(f"Invalid day {day:02d} in {label}={date_str}.")
+
+    return datetime(year, month, day, tzinfo=timezone.utc)
+
+
 def generate_date_range(start_date, end_date):
-    start = datetime.strptime(str(start_date), "%Y%m%d").replace(tzinfo=timezone.utc)
-    end = datetime.strptime(str(end_date), "%Y%m%d").replace(tzinfo=timezone.utc)
+    start = parse_yyyymmdd(start_date, label="start-date")
+    end = parse_yyyymmdd(end_date, label="end-date")
 
     current_date = start
     date_range = []
@@ -309,6 +334,25 @@ def generate_date_range(start_date, end_date):
         current_date += timedelta(days=1)
 
     return date_range
+
+
+def normalize_table_name(raw_table_name):
+    """
+    Normalize table_name to 'database.table':
+    - Strips leading 'iceberg.' if provided
+    - Converts 'database.db.table' (copied from HDFS path) to 'database.table'
+    """
+    cleaned = raw_table_name.strip().strip("/")
+    if cleaned.lower().startswith("iceberg."):
+        cleaned = cleaned[len("iceberg."):]
+    if ".db." in cleaned:
+        cleaned = cleaned.replace(".db.", ".", 1)
+        logger.warning(
+            "Normalized table-name from '%s' to '%s' (removed '.db' HDFS suffix).",
+            raw_table_name,
+            cleaned
+        )
+    return cleaned
 
 
 def run_command(cmd):
@@ -393,16 +437,18 @@ def parse_args():
     if not args.table_name or not args.table_name.strip():
         parser.error("table-name is required and cannot be empty.")
 
+    args.table_name = normalize_table_name(args.table_name)
+
     if len(str(args.start_date)) != 8 or len(str(args.end_date)) != 8:
         parser.error("start-date and end-date must be in YYYYMMDD format.")
 
     if args.start_date > args.end_date:
         parser.error("start-date must be less than or equal to end-date.")
 
-    if "." not in args.table_name:
+    if "." not in args.table_name or len(args.table_name.split(".")) != 2:
         parser.error(
             "table-name must be in the format database.table "
-            "(e.g. customer_analytics.url_dm)."
+            "(e.g. iceberg_ca_db.url_data_mart_historical)."
         )
 
     return args
