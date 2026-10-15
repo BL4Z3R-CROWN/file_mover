@@ -15,6 +15,61 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_matching_hive_partitions(spark, table_name, tbl_dt_values):
+    """
+    Use SHOW PARTITIONS (a pure Hive Metastore metadata operation) instead of
+    SELECT COUNT(*), which triggers HadoopRDD.getInputFormat() and fails with
+    java.lang.InstantiationException if InputFormat is unset/abstract on any partition.
+    """
+    target_set = {str(dt) for dt in tbl_dt_values}
+    partitions_df = spark.sql(f"SHOW PARTITIONS {table_name}")
+    all_partitions = [row[0] for row in partitions_df.collect()]
+
+    matched_partitions = []
+    for part_spec in all_partitions:
+        # part_spec looks like "tbl_dt=20260629" (or "tbl_dt=20260629/...")
+        for token in part_spec.split("/"):
+            if token.startswith("tbl_dt="):
+                val = token.split("=", 1)[1].strip("'\"")
+                if val in target_set:
+                    matched_partitions.append(part_spec)
+                break
+
+    return sorted(matched_partitions)
+
+
+def inspect_table_metadata(spark, table_name):
+    """
+    Log key metadata from DESCRIBE FORMATTED so we can see Location, InputFormat,
+    Table Type, and whether the table is MANAGED, EXTERNAL, or ICEBERG.
+    """
+    try:
+        desc_rows = spark.sql(f"DESCRIBE FORMATTED {table_name}").collect()
+        interesting_keys = {
+            "Type",
+            "Provider",
+            "Location",
+            "Serde Library",
+            "InputFormat",
+            "OutputFormat",
+            "Table Properties",
+        }
+        meta_lines = []
+        for row in desc_rows:
+            col_name = (row[0] or "").strip().rstrip(":")
+            data_type = (row[1] or "").strip()
+            if col_name in interesting_keys:
+                meta_lines.append(f"  {col_name}: {data_type}")
+        if meta_lines:
+            logger.info(
+                "Table metadata for %s:\n%s",
+                table_name,
+                "\n".join(meta_lines)
+            )
+    except Exception as exc:
+        logger.warning(f"Could not inspect metadata for {table_name}: {exc}")
+
+
 def delete_hive_tbl_dt_partitions(
     table_name,
     tbl_dt_values,
@@ -42,14 +97,15 @@ def delete_hive_tbl_dt_partitions(
     if not tbl_dt_values:
         raise ValueError("tbl_dt_values cannot be empty.")
 
-    partition_filter = ", ".join(str(x) for x in tbl_dt_values)
-
     logger.info(
         "%sPreparing to drop tbl_dt partitions %s from Hive table %s",
         "[DRY RUN] " if dry_run else "",
         tbl_dt_values,
         table_name
     )
+
+    # Inspect table metadata (Location, InputFormat, Type, etc.)
+    inspect_table_metadata(spark, table_name)
 
     # 1. Drop partitions from the Hive Metastore in batches (tbl_dt is INT).
     for i in range(0, len(tbl_dt_values), batch_size):
@@ -70,38 +126,31 @@ def delete_hive_tbl_dt_partitions(
             logger.info(f"Running Hive drop partitions:\n{drop_partition_sql}")
             spark.sql(drop_partition_sql)
 
-    # 2. Check / Validate partitions in Hive.
-    check_sql = f"""
-        SELECT tbl_dt, COUNT(*) AS row_count
-        FROM {table_name}
-        WHERE tbl_dt in ({partition_filter})
-        GROUP BY tbl_dt
-        ORDER BY tbl_dt
-    """
-
+    # 2. Check / Validate partitions in Hive Metastore via SHOW PARTITIONS.
     if dry_run:
-        logger.info("[DRY RUN] Checking existing partitions and row counts:\n%s", check_sql)
-        existing_df = spark.sql(check_sql)
-        existing_count = existing_df.count()
-        logger.info(f"[DRY RUN] Matching partitions currently in Hive: {existing_count}")
-        if existing_count > 0:
-            existing_df.show(existing_count, truncate=False)
+        logger.info("[DRY RUN] Checking existing partitions in Hive Metastore via SHOW PARTITIONS...")
+        matched = get_matching_hive_partitions(spark, table_name, tbl_dt_values)
+        logger.info(
+            "[DRY RUN] Matching partitions currently registered in Hive Metastore (%d):\n%s",
+            len(matched),
+            "\n".join(matched) if matched else "None"
+        )
         return
 
-    logger.info("Validating dropped partitions:\n%s", check_sql)
-    remaining_df = spark.sql(check_sql)
-
-    remaining_count = remaining_df.count()
+    logger.info("Validating dropped partitions via SHOW PARTITIONS...")
+    remaining_partitions = get_matching_hive_partitions(spark, table_name, tbl_dt_values)
+    remaining_count = len(remaining_partitions)
     logger.info(f"remaining_count after dropping partitions: {remaining_count}")
 
     if remaining_count > 0:
         logger.error(
-            "Partition drop validation failed. Some tbl_dt values still exist in %s",
-            table_name
+            "Partition drop validation failed. %d tbl_dt partitions still exist in %s:\n%s",
+            remaining_count,
+            table_name,
+            "\n".join(remaining_partitions)
         )
-        remaining_df.show(truncate=False)
         raise RuntimeError(
-            f"Partition drop validation failed for tbl_dt values: {tbl_dt_values}"
+            f"Partition drop validation failed for tbl_dt values: {remaining_partitions}"
         )
 
     logger.info(
@@ -160,7 +209,7 @@ def parse_args():
         required=True,
         help=(
             "Hive table to operate on, format database.table "
-            "(e.g. ca_db.detailufdrothers)."
+            "(e.g. customer_analytics.url_dm)."
         ),
     )
     parser.add_argument(
@@ -190,7 +239,7 @@ def parse_args():
     if "." not in args.table_name:
         parser.error(
             "table-name must be in the format database.table "
-            "(e.g. ca_db.detailufdrothers)."
+            "(e.g. customer_analytics.url_dm)."
         )
 
     return args
@@ -202,7 +251,7 @@ if __name__ == "__main__":
 
     start_date = args.start_date
     end_date = args.end_date
-    table_name = args.table_name  # e.g. "ca_db.detailufdrothers"
+    table_name = args.table_name  # e.g. "customer_analytics.url_dm"
     dry_run = args.dry_run
 
     database_name, _, bare_table_name = table_name.partition(".")
@@ -255,7 +304,7 @@ if __name__ == "__main__":
                     logger.warning(f"Command {cmd_run} generated an exception: {exc}")
         logger.info(
             f"[DRY RUN] Found {len(existing_dirs)} existing HDFS partition directories:\n"
-            + ("\n".join(existing_dirs) if existing_dirs else "None")
+            + ("\n".join(sorted(existing_dirs)) if existing_dirs else "None")
         )
     else:
         logger.info(f"hdfs delete commands to be executed (first 10):\n{delete_commands[:10]}")
