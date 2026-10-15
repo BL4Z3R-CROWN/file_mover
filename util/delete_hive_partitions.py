@@ -15,15 +15,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def create_spark_session(table_name):
+def create_spark_session(table_name, max_cores=16, executor_cores=4, executor_memory="8g"):
     """
     Create a SparkSession that supports BOTH native Hive tables and
-    Iceberg tables registered in the Hive Metastore.
+    Iceberg tables registered in the Hive Metastore, while capping
+    Spark Standalone cluster resources so it does not grab all cluster cores.
     """
     spark = SparkSession \
         .builder \
         .appName(f"purge_partitions:{table_name}") \
-        .config("spark.driver.maxResultSize", "256g") \
+        .config("spark.cores.max", str(max_cores)) \
+        .config("spark.executor.cores", str(executor_cores)) \
+        .config("spark.executor.memory", executor_memory) \
+        .config("spark.driver.maxResultSize", "16g") \
         .config("spark.sql.debug.maxToStringFields", 1000) \
         .config("spark.sql.parquet.writeLegacyFormat", "false") \
         .config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS") \
@@ -34,7 +38,7 @@ def create_spark_session(table_name):
         .config("spark.hadoop.fs.defaultFS", "hdfs://10.1.154.3:9000") \
         .config("hive.metastore.uris", "thrift://10.1.154.38:9083") \
         .config("spark.sql.warehouse.dir", "hdfs://10.1.154.3:9000/warehouse/hive") \
-        .config("spark.sql.shuffle.partitions", 200) \
+        .config("spark.sql.shuffle.partitions", 32) \
         .config("spark.sql.adaptive.enabled", "true") \
         .config("spark.sql.parquet.enableVectorizedWriter", "true") \
         .enableHiveSupport() \
@@ -362,6 +366,23 @@ def parse_args():
         action="store_true",
         help="(Iceberg only) Run remove_orphan_files procedure after deleting partitions.",
     )
+    parser.add_argument(
+        "--max-cores",
+        type=int,
+        default=16,
+        help="Maximum total cores across the Spark Standalone cluster (default: 16).",
+    )
+    parser.add_argument(
+        "--executor-cores",
+        type=int,
+        default=4,
+        help="Cores per executor (default: 4).",
+    )
+    parser.add_argument(
+        "--executor-memory",
+        default="8g",
+        help="Memory per executor (default: 8g).",
+    )
 
     args = parser.parse_args()
 
@@ -406,7 +427,12 @@ if __name__ == "__main__":
         tbl_dt_lst
     )
 
-    spark = create_spark_session(table_name)
+    spark = create_spark_session(
+        table_name=table_name,
+        max_cores=args.max_cores,
+        executor_cores=args.executor_cores,
+        executor_memory=args.executor_memory,
+    )
     is_iceberg, table_location = inspect_table_metadata(spark, table_name)
 
     if is_iceberg:
