@@ -71,7 +71,10 @@ def inspect_table_metadata(spark, table_name):
                 meta_lines.append(f"  {col_name}: {data_type}")
             if col_name == "Location" and data_type:
                 location = data_type
-            if col_name == "Table Properties" and "table_type=ICEBERG" in data_type.upper():
+            if col_name == "Table Properties" and (
+                "TABLE_TYPE=ICEBERG" in data_type.upper()
+                or "CURRENT-SNAPSHOT-ID" in data_type.upper()
+            ):
                 is_iceberg = True
             if col_name == "Provider" and data_type.lower() == "iceberg":
                 is_iceberg = True
