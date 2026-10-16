@@ -508,6 +508,10 @@ if __name__ == "__main__":
             f"{database_name}.db/{bare_table_name}/tbl_dt"
         )
 
+    # Explicitly stop SparkSession before running HDFS CLI commands so
+    # executors release cleanly without JVM shutdown RejectedExecutionException.
+    spark.stop()
+
     delete_commands = [
         f"hdfs dfs -rm -r -f {hdfs_base_path}={tbl_dt}"
         for tbl_dt in tbl_dt_lst
